@@ -1,72 +1,46 @@
-/*
-By downloading, copying, installing or using the software you agree to this license.
-If you do not agree to this license, do not download, install,
-copy or use the software.
-
-
-                  License Agreement For libfacedetection
-                     (3-clause BSD License)
-
-Copyright (c) 2018-2020, Shiqi Yu, all rights reserved.
-shiqi.yu@gmail.com
-
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
-
-  * Redistributions of source code must retain the above copyright notice,
-    this list of conditions and the following disclaimer.
-
-  * Redistributions in binary form must reproduce the above copyright notice,
-    this list of conditions and the following disclaimer in the documentation
-    and/or other materials provided with the distribution.
-
-  * Neither the names of the copyright holders nor the names of the contributors
-    may be used to endorse or promote products derived from this software
-    without specific prior written permission.
-
-This software is provided by the copyright holders and contributors "as is" and
-any express or implied warranties, including, but not limited to, the implied
-warranties of merchantability and fitness for a particular purpose are disclaimed.
-In no event shall copyright holders or contributors be liable for any direct,
-indirect, incidental, special, exemplary, or consequential damages
-(including, but not limited to, procurement of substitute goods or services;
-loss of use, data, or profits; or business interruption) however caused
-and on any theory of liability, whether in contract, strict liability,
-or tort (including negligence or otherwise) arising in any way out of
-the use of this software, even if advised of the possibility of such damage.
-*/
-
 #include "facedetectcnn.h"
 #include <string.h>
 #include <cmath>
 #include <vector>
 #include <float.h> //for FLT_EPSION
 #include <algorithm>//for stable_sort, sort
+using namespace std;
+
 
 typedef struct NormalizedBBox_
-{
+{ //box
     float xmin;
     float ymin;
     float xmax;
     float ymax;
-    float lm[10];
 } NormalizedBBox;
 
 
-void* myAlloc(size_t size)
+void*  myAlloc(size_t size)
 {
-    char *ptr, *ptr0;
+
+	char *ptr, *ptr0;
+	//指针128对齐
+	/*
+	 * 假设要分配size字节内存。
+	 * 基本思路就是先分配size+128-1字节的内存，
+	 * 然后在起始的128字节里，找到128对齐的那个地址，作为对齐内存首地址，返回。
+	 * 然后ptr0又多分配了一个sizeof(char*)字节的地址，在１２８对齐的ptr前８个字节里保存了ptr0的地址
+	 *
+	 */
+
 	ptr0 = (char*)malloc(
-		(size_t)(size + _MALLOC_ALIGN * ((size >= 4096) + 1L) + sizeof(char*)));
+		(size_t)(size + _MALLOC_ALIGN + sizeof(char*) -1 ));
 
 	if (!ptr0)
 		return 0;
 
 	// align the pointer
-	ptr = (char*)(((size_t)(ptr0 + sizeof(char*) + 1) + _MALLOC_ALIGN - 1) & ~(size_t)(_MALLOC_ALIGN - 1));
-	*(char**)(ptr - sizeof(char*)) = ptr0;
-    
-	return ptr;
+
+    ptr = (char*)((size_t)(ptr0 + sizeof(char*) + _MALLOC_ALIGN - 1 ) & ~(size_t)(_MALLOC_ALIGN - 1));
+    *(char**)(ptr - sizeof(char*)) = ptr0;
+
+    return ptr;
 }
 
 
@@ -82,94 +56,20 @@ void myFree_(void* ptr)
 
 }
 
-inline int dotProductUint8Int8(unsigned char * p1, signed char * p2, int num)
+inline int dotProductUint8Int8(unsigned char * p1, signed char * p2, int num, int lengthInBytes)
 {
     int sum = 0;
-    
-#if defined(_ENABLE_NEON)
-    int8x8x2_t a, b;
-    int32x4_t mul_s32x4;
-    int32x4_t result_vec;
-    result_vec = vdupq_n_s32(0); //zeros
-
-    for (int i = 0; i < num; i += 16)
-    {
-        a = vld2_s8((signed char*)p1 + i);
-        b = vld2_s8(p2 + i);
-        mul_s32x4 = vpaddlq_s16(vaddq_s16(vmull_s8(a.val[0], b.val[0]), vmull_s8(a.val[1], b.val[1])));
-        result_vec = vaddq_s32(result_vec, mul_s32x4);     
-    }
-    sum += vgetq_lane_s32(result_vec, 0);
-    sum += vgetq_lane_s32(result_vec, 1);
-    sum += vgetq_lane_s32(result_vec, 2);
-    sum += vgetq_lane_s32(result_vec, 3);
-    /*
-#if defined(_ENABLE_NEON)
-    int8x16_t a, b;
-    int32x4_t result_vec;
-    result_vec = vdupq_n_s32(0); //zeros
-
-    for (int i = 0; i < num; i += 16)
-    {
-        a = vld1q_s8((signed char*)p1 + i);
-        b = vld1q_s8(p2 + i);
-        result_vec = vdotq_s32(result_vec, a, b);
-       
-    }
-    sum += vgetq_lane_s32(result_vec, 0);
-    sum += vgetq_lane_s32(result_vec, 1);
-    sum += vgetq_lane_s32(result_vec, 2);
-    sum += vgetq_lane_s32(result_vec, 3);
-*/
-#elif defined(_ENABLE_AVX512)
-    __m512i sum_int16x32;
-    __m512i tmp_int32x16;
-    __m512i a_uint8x64, b_int8x64;
-    __m512i ones16 = _mm512_set1_epi16(1);
-    __m512i sum_int32x16 = _mm512_setzero_si512();
-    for (int i = 0; i < num; i += 64)
-    {
-        a_uint8x64 = _mm512_load_si512((__m256i const*)(p1 + i));
-        b_int8x64 = _mm512_load_si512((__m256i const*)(p2 + i));
-        sum_int16x32 = _mm512_maddubs_epi16(a_uint8x64, b_int8x64);
-        tmp_int32x16 = _mm512_madd_epi16(sum_int16x32, ones16);
-        sum_int32x16 = _mm512_add_epi32(sum_int32x16, tmp_int32x16);
-    }
-    sum += _mm512_reduce_add_epi32(sum_int32x16);
-#elif defined(_ENABLE_AVX2)
-    __m256i sum_int16x16;
-    __m256i tmp_int32x8;
-    __m256i a_uint8x32, b_int8x32;
-    __m256i ones16 = _mm256_set1_epi16(1);
-    __m256i sum_int32x8 = _mm256_setzero_si256();
-    for (int i = 0; i < num; i += 32)
-    {
-        a_uint8x32 = _mm256_load_si256((__m256i const*)(p1 + i));
-        b_int8x32 = _mm256_load_si256((__m256i const*)(p2 + i));
-        sum_int16x16 = _mm256_maddubs_epi16(a_uint8x32, b_int8x32);
-        tmp_int32x8 = _mm256_madd_epi16(sum_int16x16, ones16);
-        sum_int32x8 = _mm256_add_epi32(sum_int32x8, tmp_int32x8);
-    }
-    sum_int32x8 = _mm256_hadd_epi32(sum_int32x8, sum_int32x8);
-    sum_int32x8 = _mm256_hadd_epi32(sum_int32x8, sum_int32x8);
-    sum = ((int*)&sum_int32x8)[0] + ((int*)&sum_int32x8)[4];
-       
-#else
 
     for (int i = 0; i < num; i++)
     {
         sum += (int(p1[i]) * int(p2[i]));
     }
-
-#endif
     return sum;
 }
 
 bool convolution1x1P0S1(const CDataBlob<unsigned char> *inputData, const Filters* filters, CDataBlob<int> *outputData)
-{
-#if defined(_OPENMP)
-#pragma omp parallel for
-#endif
+{//卷积核为１＊１
+
     for (int row = 0; row < outputData->height; row++)
     {
         for (int col = 0; col < outputData->width; col++)
@@ -179,8 +79,7 @@ bool convolution1x1P0S1(const CDataBlob<unsigned char> *inputData, const Filters
             for (int ch = 0; ch < outputData->channels; ch++)
             {
                 signed char * pF = (filters->filters[ch]->data);
-                pOut[ch] = dotProductUint8Int8(pIn, pF, inputData->channels);
-                pOut[ch] += (inputData->bias * filters->filters[ch]->bias);
+                pOut[ch] = dotProductUint8Int8(pIn, pF, inputData->channels, inputData->channelStep);
             }
         }
     }
@@ -189,30 +88,34 @@ bool convolution1x1P0S1(const CDataBlob<unsigned char> *inputData, const Filters
 
 
 bool convolution3x3P0(const CDataBlob<unsigned char> *inputData, const Filters* filters, CDataBlob<int> *outputData)
-{ 
-#if defined(_OPENMP)
-#pragma omp parallel for
-#endif
+{   //卷积核为3＊3
+    /*注意　num_pixels_inbytes是一行的三个元素，所以，只需要将与y轴向下移动三次就好了，
+     * 这就是三个srcy＋＋块
+     *
+     *
+     *
+    */
+
     for (int row = 0; row < outputData->height; row++) 
     {  
         int elementStep = inputData->channelStep;
         int stride = filters->stride;
         int src_centery = row * stride;
         for (int col = 0; col < outputData->width; col++)
-        { 
-            int srcx_start = col * stride - 1;
-            int srcx_end = srcx_start + 3;
+        {
+            int srcx_start = col * stride - 1 ; //x纬度开始
+            int srcx_end = srcx_start + 3 ; //x纬度截止
             srcx_start = MAX(0, srcx_start);
             srcx_end = MIN(srcx_end, inputData->width);
-            int num_pixels_inbytes = (srcx_end - srcx_start) * elementStep;
+            int num_pixels_inbytes = (srcx_end - srcx_start) * elementStep; //所以每次乘都是每行的三个像素的，
 
             for (int ch = 0; ch < outputData->channels; ch++)
             {
                 int srcy = src_centery - 1;
 
-                unsigned char* pIn = (inputData->data + (srcy * inputData->width + srcx_start) * elementStep);
-                signed char* pF = (filters->filters[ch]->data) + (srcx_start - col * stride + 1) * elementStep;
-                int* pOut = (outputData->data + (row * outputData->width + col) * outputData->channelStep / sizeof(int));
+                unsigned char * pIn = (inputData->data + (srcy *inputData->width + srcx_start) * elementStep);
+                signed char * pF = (filters->filters[ch]->data) + ( (srcx_start - col*stride + 1)) * elementStep;
+                int * pOut = (outputData->data + (row*outputData->width + col)*outputData->channelStep / sizeof(int));
                 pOut[ch] = 0;//the new created blob is not zeros, clear it first
 
                 {
@@ -220,6 +123,7 @@ bool convolution3x3P0(const CDataBlob<unsigned char> *inputData, const Filters* 
                     {
                         pOut[ch] += dotProductUint8Int8(pIn,
                             pF,
+                            num_pixels_inbytes,
                             num_pixels_inbytes);
                     }
                 }
@@ -229,6 +133,7 @@ bool convolution3x3P0(const CDataBlob<unsigned char> *inputData, const Filters* 
                         pIn += (inputData->width * elementStep);
                         pOut[ch] += dotProductUint8Int8(pIn,
                             pF + (3 * elementStep),
+                            num_pixels_inbytes,
                             num_pixels_inbytes);
                     }
                 }
@@ -239,10 +144,10 @@ bool convolution3x3P0(const CDataBlob<unsigned char> *inputData, const Filters* 
                         pIn += (inputData->width * elementStep);
                         pOut[ch] += dotProductUint8Int8(pIn,
                             pF + (6 * elementStep),
+                            num_pixels_inbytes,
                             num_pixels_inbytes);
                     }
                 }
-                pOut[ch] += (inputData->bias * filters->filters[ch]->bias);
             }
         }
     }
@@ -262,7 +167,12 @@ bool convolution(CDataBlob<unsigned char> *inputData, const Filters* filters, CD
         cerr << __FUNCTION__ << ": There is not filters." << endl;
         return false;
     }
+    /*Filters {
+     * vector<CDataBlob<signed char> *> filters;
+     * }
+     */
     //check filters' dimensions
+    //只支持步长为２或者1,padding 为１
     int filterW = filters->filters[0]->width;
     int filterH = filters->filters[0]->height;
     int filterC = filters->filters[0]->channels;
@@ -272,7 +182,7 @@ bool convolution(CDataBlob<unsigned char> *inputData, const Filters* filters, CD
     int outputW = 0;
     int outputH = 0;
     int outputC = (int)filters->filters.size();
-
+    /*这种情况不会存在
     for (int i = 1; i < outputC; i++)
     {
         if ((filterW != filters->filters[i]->width) ||
@@ -282,7 +192,7 @@ bool convolution(CDataBlob<unsigned char> *inputData, const Filters* filters, CD
             cerr << __FUNCTION__ << ": The filters must be the same size." << endl;
             return false;
         }
-    }
+    }*/
 
     if (filterC != inputData->channels)
     {
@@ -350,15 +260,13 @@ bool convolution(CDataBlob<unsigned char> *inputData, const Filters* filters, CD
     }
 
     outputData->scale = inputData->scale * filters->scale;
-    outputData->bias = static_cast<int>(round(outputData->scale)); 
 
 	return true;
 }
 
 bool convolution_relu(CDataBlob<unsigned char> *inputData, const Filters* filters, CDataBlob<unsigned char> *outputData)
 {
-    //do convolution first
-    CDataBlob<int> tmpOutputData;
+    CDataBlob<int> tmpOutputData;  //注意这里是ｉｎｔ
     bool bFlag = convolution(inputData, filters, &tmpOutputData);
     if (bFlag == false)
         return false;
@@ -366,97 +274,34 @@ bool convolution_relu(CDataBlob<unsigned char> *inputData, const Filters* filter
     //set negative values to zeros, 
     //and find the max value
     int nMaxValue = 0;
-#if defined(_ENABLE_NEON)
-    int32x4_t max_int32x4 = vdupq_n_s32(0); //init to zeros
-    int32x4_t zeros = vdupq_n_s32(0); //zeros
-#elif defined(_ENABLE_AVX512)
-    __m512i max_int32x16 = _mm512_setzero_si512();
-#elif defined(_ENABLE_AVX2)
-    __m256i max_int32x8 = _mm256_setzero_si256();
-#endif
+
 
     for (int row = 0; row < tmpOutputData.height; row++)
     {
         for (int col = 0; col < tmpOutputData.width; col++)
         {
             int * pData = (tmpOutputData.data + (row*tmpOutputData.width + col)*tmpOutputData.channelStep / sizeof(int));
-#if defined(_ENABLE_NEON)
-            int32x4_t a;
-            int32x4_t result_vec;
 
-            for (int ch = 0; ch < tmpOutputData.channels; ch += 4)
-            {
-                a = vld1q_s32(pData + ch);
-                result_vec = vmaxq_s32(a, zeros);
-                max_int32x4 = vmaxq_s32(result_vec, max_int32x4);
-                vst1q_s32(pData + ch, result_vec);
-            }
-#elif defined(_ENABLE_AVX512)
-            __m512i a, bzeros;
-            bzeros = _mm512_setzero_si512(); //zeros
-
-            for (int ch = 0; ch < tmpOutputData.channels; ch += 16)
-            {
-                a = _mm512_load_si512((__m256i const*)(pData + ch));
-                a = _mm512_max_epi32(a, bzeros);
-                max_int32x16 = _mm512_max_epi32(a, max_int32x16);
-                _mm512_store_si512((__m512i*)(pData + ch), a);
-            }
-#elif defined(_ENABLE_AVX2)
-            __m256i a, bzeros;
-            bzeros = _mm256_setzero_si256(); //zeros
-
-            for (int ch = 0; ch < tmpOutputData.channels; ch += 8)
-            {
-                a = _mm256_load_si256((__m256i const*)(pData + ch));
-                a = _mm256_max_epi32(a, bzeros);
-                max_int32x8 = _mm256_max_epi32(a, max_int32x8);
-                _mm256_store_si256((__m256i*)(pData + ch), a);
-            }
-#else
             for (int ch = 0; ch < tmpOutputData.channels; ch++)
             {
                 pData[ch] = MAX(pData[ch], 0);
                 nMaxValue = MAX(pData[ch], nMaxValue);
             }
-#endif
         }
     }
-#if defined(_ENABLE_NEON)
-    {
-        int maxarray_int32x4[4];
-        vst1q_s32(maxarray_int32x4, max_int32x4);
-        for (int i = 0; i < 4; i++)
-            nMaxValue = MAX(maxarray_int32x4[i], nMaxValue);
-    }
-#elif defined(_ENABLE_AVX512)
-    {
-        int maxarray_int32x16[16];
-        _mm512_store_si512((__m256i*)maxarray_int32x16, max_int32x16);
-        for (int i = 0; i < 16; i++)
-            nMaxValue = MAX(maxarray_int32x16[i], nMaxValue);
-    }
-#elif defined(_ENABLE_AVX2)
-    {
-        int maxarray_int32x8[8];
-        _mm256_store_si256((__m256i*)maxarray_int32x8, max_int32x8);
-        for (int i = 0; i < 8; i++)
-            nMaxValue = MAX(maxarray_int32x8[i], nMaxValue);
-    }
-#endif
+
 
     //scale the data to uint8 or int8
     float fCurrentScale = (_MAX_UINT8_VALUE) / float(nMaxValue);
     outputData->create(tmpOutputData.width, tmpOutputData.height, tmpOutputData.channels);
     outputData->scale = tmpOutputData.scale * fCurrentScale;
-    outputData->bias = static_cast<int>(round(tmpOutputData.bias * fCurrentScale ));
 
     for (int row = 0; row < outputData->height; row++)
     {
         for (int col = 0; col < outputData->width; col++)
         {
-            int * pInt32Data = (tmpOutputData.data + (size_t(row) * tmpOutputData.width + col)*tmpOutputData.channelStep / sizeof(int));
-            unsigned char * pUInt8Data = (outputData->data + (size_t(row) *outputData->width + col)*outputData->channelStep / sizeof(unsigned char));
+            int * pInt32Data = (tmpOutputData.data + (row*tmpOutputData.width + col)*tmpOutputData.channelStep / sizeof(int));
+            unsigned char * pUInt8Data = (outputData->data + (row*outputData->width + col)*outputData->channelStep / sizeof(unsigned char));
 
             for (int ch = 0; ch < outputData->channels; ch++)
             {
@@ -485,17 +330,16 @@ bool maxpooling2x2S2(const CDataBlob<unsigned char> *inputData, CDataBlob<unsign
         return false;
     }
 
-    int lineElementStep = inputData->width * inputData->channelStep;
+    //int lineElementStep = inputData->width * inputData->channelStep;
 
     outputData->create(outputW, outputH, outputC);
     outputData->scale = inputData->scale;
-    outputData->bias = inputData->bias;
 
     for (int row = 0; row < outputData->height; row++)
     {
         for (int col = 0; col < outputData->width; col++)
         {
-            size_t inputMatOffsetsInElement[4];
+            int inputMatOffsetsInElement[4];
             int elementCount = 0;
 
             int hstart = row * 2;
@@ -506,50 +350,12 @@ bool maxpooling2x2S2(const CDataBlob<unsigned char> *inputData, CDataBlob<unsign
             for (int fy = hstart; fy < hend; fy++)
                 for (int fx = wstart; fx < wend; fx++)
                 {
-                    inputMatOffsetsInElement[elementCount++] = (size_t(fy) *inputData->width + fx) * inputData->channelStep / sizeof(unsigned char);
+                    inputMatOffsetsInElement[elementCount++] = (fy *inputData->width + fx) * inputData->channelStep / sizeof(unsigned char);
                 }
 
-            unsigned char * pOut = outputData->data + (size_t(row) * outputData->width + col) * outputData->channelStep / sizeof(unsigned char);
+            unsigned char * pOut = outputData->data + (row*outputData->width + col) * outputData->channelStep / sizeof(unsigned char);
             unsigned char * pIn = inputData->data;
 
-#if defined(_ENABLE_NEON)
-            for (int ch = 0; ch < outputData->channels; ch += 16)
-            {
-                uint8x16_t a;
-                uint8x16_t maxval = vld1q_u8(pIn + ch + inputMatOffsetsInElement[0]);
-                for (int el = 1; el < elementCount; el++)
-                {
-                    a = vld1q_u8(pIn + ch + inputMatOffsetsInElement[el]);
-                    maxval = vmaxq_u8(maxval, a);
-                }
-                vst1q_u8(pOut + ch, maxval);
-            }
-
-#elif defined(_ENABLE_AVX512)
-            for (int ch = 0; ch < outputData->channels; ch += 64)
-            {
-                __m512i a;
-                __m512i maxval_uint8x64 = _mm512_load_si512((__m512i const*)(pIn + ch + inputMatOffsetsInElement[0]));
-                for (int el = 1; el < elementCount; el++)
-                {
-                    a = _mm512_load_si512((__m512i const*)(pIn + ch + inputMatOffsetsInElement[el]));
-                    maxval_uint8x64 = _mm512_max_epu8(maxval_uint8x64, a);
-                }
-                _mm512_store_si512((__m512i*)(pOut + ch), maxval_uint8x64);
-            }
-#elif defined(_ENABLE_AVX2)
-            for (int ch = 0; ch < outputData->channels; ch += 32)
-            {
-                __m256i a;
-                __m256i maxval_uint8x32 = _mm256_load_si256((__m256i const*)(pIn + ch + inputMatOffsetsInElement[0]));
-                for (int el = 1; el < elementCount; el++)
-                {
-                    a = _mm256_load_si256((__m256i const*)(pIn + ch + inputMatOffsetsInElement[el]));
-                    maxval_uint8x32 = _mm256_max_epu8(maxval_uint8x32, a);
-                }
-                _mm256_store_si256((__m256i*)(pOut + ch), maxval_uint8x32);
-            }
-#else
 
             for (int ch = 0; ch < outputData->channels; ch++)
             {
@@ -561,7 +367,6 @@ bool maxpooling2x2S2(const CDataBlob<unsigned char> *inputData, CDataBlob<unsign
                 }
                 pOut[ch] = maxval;
             }
-#endif
         }
     }
 
@@ -643,15 +448,73 @@ bool convertInt2Float(CDataBlob<int> * inputData, CDataBlob<float> * outputData)
             }
         }
     }
-    outputData->scale = 1.0f;
-    outputData->bias = (int)roundf(inputData->bias * s);
+
     return true;
 }
 
-
-bool priorbox(const CDataBlob<unsigned char> * featureData, int img_width, int img_height, int step, int num_sizes, float * pWinSizes, CDataBlob<float> * outputData)
+bool normalize(CDataBlob<unsigned char> * inputOutputData, float * pScale)
 {
+    if ((inputOutputData->data == NULL) || pScale == NULL)
+    {
+        cerr << __FUNCTION__ << ": The input data is null." << endl;
+        return false;
+    }
+
+    CDataBlob<float> tmpData;
+    tmpData.create(inputOutputData->width, inputOutputData->height, inputOutputData->channels);
+
+    //normlize it,
+    //and find the max value
+    //because the input data is non-negative, so only the max value is needed
+    float fMaxValue = 0;
+    for (int row = 0; row < inputOutputData->height; row++)
+    {
+        for (int col = 0; col < inputOutputData->width; col++)
+        {
+            unsigned char * pInData = (inputOutputData->data + (row*inputOutputData->width + col)*inputOutputData->channelStep / sizeof(unsigned char));
+            float * pTmpData = (float*)(tmpData.data + (row*tmpData.width + col)*tmpData.channelStep / sizeof(float));
+            float sum = FLT_EPSILON;
+            float s = 0;
+
+
+            for (int ch = 0; ch < inputOutputData->channels; ch++)
+                sum += ( float(pInData[ch]) * float(pInData[ch]));
+
+            s = 1.0f / sqrt(sum);
+
+            for (int ch = 0; ch < inputOutputData->channels; ch++)
+            {
+                pTmpData[ch] = pInData[ch] * pScale[ch] * s;  //pTmpData保存归一化的值
+                fMaxValue = MAX(pTmpData[ch], fMaxValue);
+            }
+        }
+    }
+
+    //scale the data to uint8 or int8
+    float fCurrentScale = (_MAX_UINT8_VALUE) / float(fMaxValue);
+    inputOutputData->scale = fCurrentScale;
+
+    for (int row = 0; row < inputOutputData->height; row++)
+    {
+        for (int col = 0; col < inputOutputData->width; col++)
+        {
+            float * pTmpData = (tmpData.data + (row*tmpData.width + col)*tmpData.channelStep / sizeof(float));
+            unsigned char * pUInt8Data = (inputOutputData->data + (row*inputOutputData->width + col)*inputOutputData->channelStep / sizeof(unsigned char));
+
+            for (int ch = 0; ch < inputOutputData->channels; ch++)
+            {
+                pUInt8Data[ch] = (unsigned char)(pTmpData[ch] * fCurrentScale + 0.499f);
+            }
+        }
+    }
+
+    return true;
+}
+
+bool priorbox(const CDataBlob<unsigned char> * featureData, const CDataBlob<unsigned char> * imageData, int num_sizes, float * pWinSizes, CDataBlob<float> * outputData)
+{//只是根据featureData和imageData的size生成一些anchor_box并没有预测值
     if ((featureData->data == NULL) ||
+        imageData->data == NULL||
         pWinSizes == NULL)
     {
         cerr << __FUNCTION__ << ": The input data is null." << endl;
@@ -660,6 +523,13 @@ bool priorbox(const CDataBlob<unsigned char> * featureData, int img_width, int i
 
     int feature_width = featureData->width;
     int feature_height = featureData->height;
+    int image_width = imageData->width * 2;  //刚开始在create的时候尺寸缩小到一半，通道27
+    int image_height = imageData->height * 2;
+
+	float step_w = static_cast<float>(image_width) / feature_width;
+	float step_h = static_cast<float>(image_height) / feature_height;
+
+	//float * output_data = outputData->data;
 
     outputData->create(feature_width, feature_height, num_sizes * 4);
 
@@ -667,23 +537,25 @@ bool priorbox(const CDataBlob<unsigned char> * featureData, int img_width, int i
 	{
 		for (int w = 0; w < feature_width; ++w) 
 		{
-            float * pOut = (float*)(outputData->data + ( size_t(h) * outputData->width + w) * outputData->channelStep / sizeof(float));
+            float * pOut = (float*)(outputData->data + ( h * outputData->width + w) * outputData->channelStep / sizeof(float));
             int idx = 0;
             //priorbox
 			for (int s = 0; s < num_sizes; s++) 
 			{
 				float min_size_ = pWinSizes[s];
+                float box_width, box_height;
+                box_width = box_height = min_size_;
                 
-                float center_x = (w + 0.5f) * step;
-                float center_y = (h + 0.5f) * step;
+                float center_x = w * step_w + step_w / 2.0f;
+                float center_y = h * step_h + step_h / 2.0f;
                 // xmin
-                pOut[idx++] = (center_x - min_size_ / 2.f) / img_width;
+                pOut[idx++] = (center_x - box_width / 2.f) / image_width;
                 // ymin
-                pOut[idx++] = (center_y - min_size_ / 2.f) / img_height;
+                pOut[idx++] = (center_y - box_height / 2.f) / image_height;
                 // xmax
-                pOut[idx++] = (center_x + min_size_ / 2.f) / img_width;
+                pOut[idx++] = (center_x + box_width / 2.f) / image_width;
                 // ymax
-                pOut[idx++] = (center_y + min_size_ / 2.f) / img_height;
+                pOut[idx++] = (center_y + box_height / 2.f) / image_height;
 
 			}
 		}
@@ -709,9 +581,6 @@ bool softmax1vector2class(CDataBlob<float> *inputOutputData)
     int num = inputOutputData->channels;
     float * pData = inputOutputData->data;
 
-//#if defined(_OPENMP)
-//#pragma omp parallel for
-//#endif
     for(int i = 0; i < num; i+= 2)
     {
         float v1 = pData[i];
@@ -719,8 +588,8 @@ bool softmax1vector2class(CDataBlob<float> *inputOutputData)
         float vm = MAX(v1, v2);
         v1 -= vm;
         v2 -= vm;
-        v1 = expf(v1);
-        v2 = expf(v2);
+        v1 = exp(v1);  //expf在１１的标准上没有
+        v2 = exp(v2);
         vm = v1 + v2;
         pData[i] = v1/vm;
         pData[i+1] = v2/vm;
@@ -730,7 +599,11 @@ bool softmax1vector2class(CDataBlob<float> *inputOutputData)
 
 template<typename T>
 bool blob2vector(const CDataBlob<T> * inputData, CDataBlob<T> * outputData)
-{
+{   //将矩阵变为一维矩阵即安装通道，列，行的排列
+    //inputData是128对齐的，且通道数也是对齐的
+    //outputData仅仅是128对齐
+    //但是outputData通过create后就是两个都对齐了，如果outputData不用对齐后的通道，那就是浪费了空间了
+
     if (inputData->data == NULL || outputData == NULL)
     {
         cerr << __FUNCTION__ << ": The input or output data is null." << endl;
@@ -739,7 +612,6 @@ bool blob2vector(const CDataBlob<T> * inputData, CDataBlob<T> * outputData)
 
     outputData->create(1, 1, inputData->width * inputData->height * inputData->channels);
     outputData->scale = inputData->scale;
-    outputData->bias = inputData->bias;
 
     int bytesOfAChannel = inputData->channels * sizeof(T);
     T * pOut = outputData->data;
@@ -747,9 +619,10 @@ bool blob2vector(const CDataBlob<T> * inputData, CDataBlob<T> * outputData)
     {
         for (int col = 0; col < inputData->width; col++)
         {
-            T * pIn = (inputData->data + (size_t(row) * inputData->width + col) * inputData->channelStep / sizeof(T));
+            T * pIn = (inputData->data + (row*inputData->width + col)*inputData->channelStep / sizeof(T));
             memcpy(pOut, pIn, bytesOfAChannel);
             pOut += inputData->channels;
+
         }
     }
 
@@ -761,7 +634,7 @@ template bool blob2vector(const CDataBlob<float> * inputData, CDataBlob<float> *
 
 void IntersectBBox(const NormalizedBBox& bbox1, const NormalizedBBox& bbox2,
                    NormalizedBBox* intersect_bbox) 
-{
+{//俩两个box的交叉部分
     if (bbox2.xmin > bbox1.xmax || bbox2.xmax < bbox1.xmin ||
         bbox2.ymin > bbox1.ymax || bbox2.ymax < bbox1.ymin) 
     {
@@ -781,7 +654,8 @@ void IntersectBBox(const NormalizedBBox& bbox1, const NormalizedBBox& bbox2,
 }
 
 float JaccardOverlap(const NormalizedBBox& bbox1, const NormalizedBBox& bbox2)
-{
+{// IOU Value
+
     NormalizedBBox intersect_bbox;
     IntersectBBox(bbox1, bbox2, &intersect_bbox);
     float intersect_width, intersect_height;
@@ -815,7 +689,7 @@ bool detection_output(const CDataBlob<float> * priorbox, const CDataBlob<float> 
         return 0;
     }
 
-    if (priorbox->channels != conf->channels * 2 || loc->channels != conf->channels*7 )
+    if (priorbox->channels != loc->channels || loc->channels != conf->channels*2 )
     {
         cerr << __FUNCTION__ << ": The sizes of the inputs are not match." << endl;
         cerr << "priorbox channels=" << priorbox->channels << ", loc channels=" << loc->channels << ", conf channels=" << conf->channels << endl;
@@ -831,75 +705,65 @@ bool detection_output(const CDataBlob<float> * priorbox, const CDataBlob<float> 
     vector<pair<float, NormalizedBBox> > final_score_bbox_vec;
 
     //get the candidates those are > confidence_threshold
-    for(int i = 0; i < conf->channels; i+=2)
+    for(int i = 1; i < conf->channels; i+=2)
     {
-        float conf = pConf[i + 1];
-        int face_idx = i / 2;
-        if(conf > confidence_threshold)
+        if(pConf[i] > confidence_threshold)
         {
-            float fBox_x1 = pPriorBox[face_idx * 4];
-            float fBox_y1 = pPriorBox[face_idx * 4 + 1];
-            float fBox_x2 = pPriorBox[face_idx * 4 + 2];
-            float fBox_y2 = pPriorBox[face_idx * 4 + 3];
+            float fx1 = pPriorBox[i*2-2];  //min_x
+            float fy1 = pPriorBox[i*2-1];  //min_y
+            float fx2 = pPriorBox[i*2];  //max_x
+            float fy2 = pPriorBox[i*2+1];  //max_y
 
-            float locx1 = pLoc[face_idx * 14];
-            float locy1 = pLoc[face_idx * 14 + 1];
-            float locx2 = pLoc[face_idx * 14 + 2];
-            float locy2 = pLoc[face_idx * 14 + 3];
+            float locx1 = pLoc[i * 2 - 2];
+            float locy1 = pLoc[i * 2 - 1];
+            float locx2 = pLoc[i * 2];
+            float locy2 = pLoc[i * 2 + 1];
 
-            float prior_width = fBox_x2 - fBox_x1;
-            float prior_height = fBox_y2 - fBox_y1;
-            float prior_center_x = (fBox_x1 + fBox_x2)/2;
-            float prior_center_y = (fBox_y1 + fBox_y2)/2;
+            float prior_width = fx2 - fx1;
+            float prior_height = fy2 - fy1;
+            float prior_center_x = (fx1 + fx2)/2;
+            float prior_center_y = (fy1 + fy2)/2;
 
             float box_centerx = prior_variance[0] * locx1 * prior_width + prior_center_x;
             float box_centery = prior_variance[1] * locy1 * prior_height + prior_center_y;
-            float box_width = expf(prior_variance[2] * locx2) * prior_width;
-            float box_height = expf(prior_variance[3] * locy2) * prior_height;
+            float box_width = exp(prior_variance[2] * locx2) * prior_width;
+            float box_height = exp(prior_variance[3] * locy2) * prior_height;
+            //float box_width = expf(prior_variance[2] * locx2) * prior_width;  //expf在１１的标准上没有
+           // float box_height = expf(prior_variance[3] * locy2) * prior_height;
 
-            fBox_x1 = box_centerx - box_width / 2.f;
-            fBox_y1 = box_centery - box_height /2.f;
-            fBox_x2 = box_centerx + box_width / 2.f;
-            fBox_y2 = box_centery + box_height /2.f;
+            fx1 = box_centerx - box_width / 2.f;
+            fy1 = box_centery - box_height /2.f;
+            fx2 = box_centerx + box_width / 2.f;
+            fy2 = box_centery + box_height /2.f;
 
-            fBox_x1 = MAX(0, fBox_x1);
-            fBox_y1 = MAX(0, fBox_y1);
-            fBox_x2 = MIN(1.f, fBox_x2);
-            fBox_y2 = MIN(1.f, fBox_y2);
+            fx1 = MAX(0, fx1);
+            fy1 = MAX(0, fy1);
+            fx2 = MIN(1.f, fx2);
+            fy2 = MIN(1.f, fy2);
 
             NormalizedBBox bb;
-            bb.xmin = fBox_x1;
-            bb.ymin = fBox_y1;
-            bb.xmax = fBox_x2;
-            bb.ymax = fBox_y2;
-            //store the five landmarks
-            for (int i = 0; i < 5; i++)
-            {
-                float lmx = pLoc[face_idx * 14 + 4 + i * 2];
-                float lmy = pLoc[face_idx * 14 + 4 + i * 2 + 1];
-                lmx = prior_variance[0] * lmx * prior_width + prior_center_x;
-                lmy = prior_variance[1] * lmy * prior_height + prior_center_y;
-                bb.lm[i * 2] = lmx;
-                bb.lm[i * 2 + 1] = lmy;
-            }
+            bb.xmin = fx1;
+            bb.ymin = fy1;
+            bb.xmax = fx2;
+            bb.ymax = fy2;
 
-            score_bbox_vec.push_back(std::make_pair(conf, bb));
+            score_bbox_vec.push_back(std::make_pair(pConf[i], bb));
         }
     }
 
     //Sort the score pair according to the scores in descending order
-    std::stable_sort(score_bbox_vec.begin(), score_bbox_vec.end(), SortScoreBBoxPairDescend);
+    std::stable_sort(score_bbox_vec.begin(), score_bbox_vec.end(), SortScoreBBoxPairDescend);  //也可以使用ｓｏｒｔ
+
 
     // Keep top_k scores if needed.
     if (top_k > -1 && top_k < score_bbox_vec.size()) {
-        score_bbox_vec.resize(top_k);
+        score_bbox_vec.resize(top_k);  //保留前top_k个
     }
-
 
     //Do NMS
     final_score_bbox_vec.clear();
     while (score_bbox_vec.size() != 0) {
-        const NormalizedBBox bb1 = score_bbox_vec.front().second;
+        const NormalizedBBox bb1 = score_bbox_vec.front().second;  //second是因为make_pair 将pConf和bb打包了
         bool keep = true;
         for (int k = 0; k < final_score_bbox_vec.size(); ++k)
         {
@@ -914,7 +778,7 @@ bool detection_output(const CDataBlob<float> * priorbox, const CDataBlob<float> 
                 break;
             }
         }
-        if (keep) {
+        if (keep) {  //针对最大的那个值，即排序后的第一个
             final_score_bbox_vec.push_back(score_bbox_vec.front());
         }
         score_bbox_vec.erase(score_bbox_vec.begin());
@@ -929,20 +793,16 @@ bool detection_output(const CDataBlob<float> * priorbox, const CDataBlob<float> 
         outputData->setNULL();
     else
     {
-        outputData->create(num_faces, 1, 15);
+        outputData->create(num_faces, 1, 5);
         for (int fi = 0; fi < num_faces; fi++)
         {
             pair<float, NormalizedBBox> pp = final_score_bbox_vec[fi];
-            float * pOut = (outputData->data + size_t(fi) * outputData->channelStep / sizeof(float));
-            pOut[0] = pp.first;
+            float * pOut = (outputData->data + fi * outputData->channelStep / sizeof(float));
+            pOut[0] = pp.first; //cof
             pOut[1] = pp.second.xmin;
             pOut[2] = pp.second.ymin;
             pOut[3] = pp.second.xmax;
             pOut[4] = pp.second.ymax;
-            //copy landmark data
-            for (int lm = 0; lm < 10; lm++)
-                pOut[5 + lm] = pp.second.lm[lm];
-
         }
     }
 
